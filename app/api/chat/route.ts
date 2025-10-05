@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { checkRedFlags, getMedicalKnowledge } from "@/lib/medicalKnowledge";
+import { searchMedicalKnowledge, getDrugInfo, getMentalHealthInfo } from "@/lib/medicalDatasets";
 
 // Agent-specific system prompts
 const AGENT_PROMPTS: Record<string, string> = {
@@ -30,19 +31,32 @@ export async function POST(request: NextRequest) {
       });
     }
 
-    // Get relevant medical knowledge
-    const knowledge = getMedicalKnowledge(message);
+    // Get relevant medical knowledge from multiple sources
+    const basicKnowledge = getMedicalKnowledge(message);
+    const advancedKnowledge = searchMedicalKnowledge(message);
+    
+    // Check for drug-related queries
+    const drugMatch = message.match(/\b(aspirin|metformin|ibuprofen|medication|drug|medicine)\b/i);
+    let drugInfo = "";
+    if (drugMatch) {
+      const drug = getDrugInfo(drugMatch[1]);
+      if (drug) {
+        drugInfo = `\n\nDrug Information:\n- ${drug.name} (${drug.genericName})\n- Indications: ${drug.indications.join(", ")}\n- Common side effects: ${drug.sideEffects.slice(0, 3).join(", ")}\n- Always consult your healthcare provider before starting any medication.`;
+      }
+    }
+
+    // Check for mental health queries
+    const mentalHealthMatch = message.match(/\b(anxiety|depression|stress|mental health)\b/i);
+    let mentalHealthInfo = "";
+    if (mentalHealthMatch) {
+      const mhData = getMentalHealthInfo(mentalHealthMatch[1]);
+      if (mhData) {
+        mentalHealthInfo = `\n\nMental Health Resources:\n- Condition: ${mhData.condition}\n- Common treatments: ${mhData.treatments.slice(0, 3).join(", ")}\n- Screening tools: ${mhData.screeningTools.join(", ")}\n- If you're in crisis, call 988 (Suicide & Crisis Lifeline)`;
+      }
+    }
 
     // Build context from user profile
-    const userContext = userProfile ? `
-User Profile:
-- Age: ${userProfile.age}
-- Gender: ${userProfile.gender}
-- BMI: ${userProfile.bmi} (${userProfile.bmi < 18.5 ? 'Underweight' : userProfile.bmi < 25 ? 'Normal' : userProfile.bmi < 30 ? 'Overweight' : 'Obese'})
-- Health Goals: ${userProfile.lifestyleGoals}
-${userProfile.medicalHistory ? `- Medical History: ${userProfile.medicalHistory}` : ''}
-${userProfile.currentMedications ? `- Current Medications: ${userProfile.currentMedications}` : ''}
-` : '';
+    const userContext = userProfile ? `\nUser Profile:\n- Age: ${userProfile.age}\n- Gender: ${userProfile.gender}\n- BMI: ${userProfile.bmi} (${userProfile.bmi < 18.5 ? 'Underweight' : userProfile.bmi < 25 ? 'Normal' : userProfile.bmi < 30 ? 'Overweight' : 'Obese'})\n- Health Goals: ${userProfile.lifestyleGoals}\n${userProfile.medicalHistory ? `- Medical History: ${userProfile.medicalHistory}` : ''}\n${userProfile.currentMedications ? `- Current Medications: ${userProfile.currentMedications}` : ''}\n` : '';
 
     // Get agent-specific prompt
     const systemPrompt = AGENT_PROMPTS[agentId] || AGENT_PROMPTS.general;
@@ -61,13 +75,17 @@ ${userProfile.currentMedications ? `- Current Medications: ${userProfile.current
               "Content-Type": "application/json",
             },
             body: JSON.stringify({
-              inputs: `${systemPrompt}\n\n${userContext}\n\nRelevant Medical Knowledge:\n${knowledge}\n\nUser Question: ${message}\n\nPlease provide a helpful, evidence-based response. Keep it concise (2-3 paragraphs).`,
+              inputs: `${systemPrompt}\n\n${userContext}\n\nRelevant Medical Knowledge:\n${basicKnowledge}\n\nUser Question: ${message}\n\nProvide a helpful, evidence-based response in 2-3 paragraphs. Include specific recommendations.`,
               parameters: {
-                max_new_tokens: 400,
+                max_new_tokens: 500,
                 temperature: 0.7,
                 top_p: 0.9,
                 return_full_text: false,
                 do_sample: true
+              },
+              options: {
+                wait_for_model: true,
+                use_cache: false
               }
             }),
           }
@@ -83,7 +101,10 @@ ${userProfile.currentMedications ? `- Current Medications: ${userProfile.current
             aiResponse = data.generated_text.trim();
           }
 
-          if (aiResponse) {
+          if (aiResponse && aiResponse.length > 50) {
+            // Add drug and mental health info if relevant
+            aiResponse += drugInfo + mentalHealthInfo;
+            
             const disclaimer = "\n\n⚠️ Disclaimer: This information is for educational purposes only and is not a substitute for professional medical advice, diagnosis, or treatment. Always consult with a qualified healthcare provider for medical concerns.";
             
             const finalResponse = aiResponse.includes("Disclaimer") || aiResponse.includes("disclaimer") 
@@ -92,23 +113,63 @@ ${userProfile.currentMedications ? `- Current Medications: ${userProfile.current
 
             return NextResponse.json({ 
               response: finalResponse,
-              model: "BioGPT-Large"
+              model: "BioGPT-Large",
+              sources: advancedKnowledge.length > 0 ? advancedKnowledge.map(k => k.source) : []
             });
           }
         } else {
-          console.error("BioGPT API error:", await response.text());
+          const errorText = await response.text();
+          console.error("BioGPT API error:", errorText);
         }
       } catch (apiError) {
         console.error("BioGPT API error:", apiError);
       }
     }
 
-    // Fallback response based on medical knowledge
-    const fallbackResponse = `${systemPrompt.split('.')[0]}.\n\n${knowledge}\n\nBased on your profile (Age: ${userProfile?.age || 'N/A'}, BMI: ${userProfile?.bmi || 'N/A'}), I recommend consulting with a healthcare professional for personalized advice specific to your situation.\n\n⚠️ Disclaimer: This information is for educational purposes only and is not a substitute for professional medical advice, diagnosis, or treatment.`;
+    // Enhanced fallback response using medical datasets
+    let enhancedResponse = "";
+    
+    if (advancedKnowledge.length > 0) {
+      // Use curated medical Q&A
+      const bestMatch = advancedKnowledge[0];
+      enhancedResponse = `Based on evidence from ${bestMatch.source}:\n\n${bestMatch.answer}`;
+    } else {
+      // Use basic knowledge
+      enhancedResponse = basicKnowledge;
+    }
+
+    // Add personalized recommendations
+    if (userProfile) {
+      enhancedResponse += `\n\n**Personalized Recommendations for You:**\n`;
+      enhancedResponse += `- Age: ${userProfile.age} years - `;
+      
+      if (userProfile.age < 30) {
+        enhancedResponse += `Focus on building healthy habits now for long-term wellness.\n`;
+      } else if (userProfile.age < 50) {
+        enhancedResponse += `Maintain preventive care and regular health screenings.\n`;
+      } else {
+        enhancedResponse += `Prioritize chronic disease prevention and management.\n`;
+      }
+      
+      enhancedResponse += `- BMI: ${userProfile.bmi} - `;
+      if (userProfile.bmi < 18.5) {
+        enhancedResponse += `Consider consulting a nutritionist for healthy weight gain strategies.\n`;
+      } else if (userProfile.bmi >= 25) {
+        enhancedResponse += `Focus on balanced nutrition and regular physical activity.\n`;
+      } else {
+        enhancedResponse += `Maintain your healthy weight through balanced lifestyle.\n`;
+      }
+    }
+
+    // Add drug and mental health info
+    enhancedResponse += drugInfo + mentalHealthInfo;
+
+    const disclaimer = "\n\n⚠️ Disclaimer: This information is for educational purposes only and is not a substitute for professional medical advice, diagnosis, or treatment. Always consult with a qualified healthcare provider for medical concerns.";
     
     return NextResponse.json({ 
-      response: fallbackResponse,
-      model: "Fallback"
+      response: enhancedResponse + disclaimer,
+      model: "Enhanced Knowledge Base",
+      sources: advancedKnowledge.length > 0 ? advancedKnowledge.map(k => k.source) : ["Medical Knowledge Base"]
     });
 
   } catch (error) {
