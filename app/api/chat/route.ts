@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { checkRedFlags, getMedicalKnowledge } from "@/lib/medicalKnowledge";
+import { checkRedFlags } from "@/lib/medicalKnowledge";
 import { searchMedicalKnowledge, getDrugInfo, getMentalHealthInfo } from "@/lib/medicalDatasets";
 
 // Agent-specific system prompts
@@ -39,7 +39,6 @@ export async function POST(request: NextRequest) {
     }
 
     // Get relevant medical knowledge from multiple sources
-    const basicKnowledge = getMedicalKnowledge(message);
     const advancedKnowledge = searchMedicalKnowledge(message);
     
     // Check for drug-related queries
